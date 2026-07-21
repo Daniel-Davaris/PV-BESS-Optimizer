@@ -1,0 +1,26 @@
+# Main environment — Python 3.13 (latest)
+# python3 -m venv venv-optimizer
+# Install with: pip install -r requirements-main.txt
+
+
+# Data
+pandas
+numpy
+matplotlib
+nbformat
+tqdm
+
+# LP
+PuLP
+
+# System
+psutil
+
+# Export
+openpyxl
+XlsxWriter
+
+nbformat
+jinja2
+plotly
+anywidget

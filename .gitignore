@@ -1,0 +1,4 @@
+optimizer/2_Optimizer/Optimization_data/*
+
+optimizer/1_Dataset/2_Processed_data/predicted_prices.csv
+optimizer/1_Dataset/2_Processed_data/resampled_aurora_price.csv
