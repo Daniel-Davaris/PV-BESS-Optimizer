@@ -75,7 +75,7 @@ display_window_scheduler_visual = False
 # -----------------------------------------------------------------------------------------------------------------------------------------------------------------
 # Optimise using: Actual electricity price -> 1
 # Optimize using: Predicted electricity price -> 2
-optimisation_directive = 2
+optimisation_directive = 1
 
 # If using predicted prices
 if optimisation_directive == 2:
