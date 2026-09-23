@@ -1,0 +1,17 @@
+# Local/raw/generated data. These files are intentionally kept out of Git;
+# regenerate them with the dataset and optimizer notebooks.
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.pkl
+*.pickle
+
+# The CSV-backed application configuration is source-controlled.
+!optimizer/configuration_tables/*.csv
+
+# Python and notebook runtime artefacts.
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
