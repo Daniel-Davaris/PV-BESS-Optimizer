@@ -26,7 +26,9 @@ PRICE_TIMEFRAMES = ("Historical back-test", "Future projection")
 FORESIGHT_TYPES = ("Perfect foresight", "Realistic foresight")
 GENERATION_PROFILES = ("Standard year", "Observed values")
 PREDICTION_TRANSFORMS = ("Normal predicted value", "Transform to binary signal", "Both")
-LGC_ELIGIBILITY_BASES = ("Generation", "Renewable dispatched", "Net export")
+LGC_ELIGIBILITY_BASES = (
+    "Generation", "Renewable dispatched", "Net export", "TLF-adjusted net export"
+)
 
 # Current naming convention. Internal B1S/B1SM keys distinguish the B1
 # standard-year variants from observed historical generation.
@@ -59,10 +61,13 @@ ASSET_COLUMNS = [
     "project_poi_export_limit_MW", "project_poi_import_limit_MW",
     "project_poi_export_limit_MWh_per_interval",
     "project_poi_import_limit_MWh_per_interval", "grid_import_penalty",
+    "optimize_with_DUOS",
     "TLF_PV_injection", "TLF_BESS_injection", "TLF_BESS_withdrawal",
-    "LGC_eligibility_basis",
+    "price_escalation_factor", "LGC_eligibility_basis",
+    "LGC_price_override_per_MWh",
     "BESS_technology", "BESS_coupling_type", "BESS_duration_hours",
-    "BESS_power_MW", "BESS_usable_fraction", "BESS_Start_SoC",
+    "BESS_power_MW", "BESS_usable_fraction", "BESS_energy_override_MWh",
+    "BESS_Start_SoC",
     "BESS_cycles_per_day", "BESS_lifetime_years",
 ]
 
@@ -199,21 +204,26 @@ class CsvTableStore:
         name = str(record.get("asset_name", "")).strip()
         if not name:
             raise ValueError("asset_name is required.")
+        record["asset_name"] = name
         if record.get("state") not in STATES:
             raise ValueError(f"state must be one of {STATES}.")
         if record.get("BESS_coupling_type") not in {"AC", "DC"}:
             raise ValueError("BESS_coupling_type must be AC or DC.")
         if record.get("LGC_eligibility_basis") not in LGC_ELIGIBILITY_BASES:
             raise ValueError(f"LGC_eligibility_basis must be one of {LGC_ELIGIBILITY_BASES}.")
+        record["optimize_with_DUOS"] = _bool(record.get("optimize_with_DUOS", True))
         for field in (
             "project_poi_export_limit_MW", "project_poi_import_limit_MW",
             "grid_import_penalty", "BESS_duration_hours", "BESS_power_MW",
             "BESS_cycles_per_day", "BESS_lifetime_years", "TLF_PV_injection",
-            "TLF_BESS_injection", "TLF_BESS_withdrawal",
+            "TLF_BESS_injection", "TLF_BESS_withdrawal", "price_escalation_factor",
+            "LGC_price_override_per_MWh", "BESS_energy_override_MWh",
         ):
             record[field] = float(record[field])
             if record[field] < 0:
                 raise ValueError(f"{field} cannot be negative.")
+        if record["price_escalation_factor"] <= 0:
+            raise ValueError("price_escalation_factor must be greater than zero.")
         record["BESS_Start_SoC"] = float(record["BESS_Start_SoC"])
         if not 0 <= record["BESS_Start_SoC"] <= 1:
             raise ValueError("BESS_Start_SoC must be between 0 and 1.")
@@ -225,10 +235,12 @@ class CsvTableStore:
         record["project_poi_export_limit_MWh_per_interval"] = record["project_poi_export_limit_MW"] * interval_fraction
         record["project_poi_import_limit_MWh_per_interval"] = record["project_poi_import_limit_MW"] * interval_fraction
         frame = self.assets()
-        existing = frame["asset_name"].astype(str) == name
+        existing = frame["asset_name"].astype(str).str.strip() == name
         row = {column: record.get(column, "") for column in ASSET_COLUMNS}
         if existing.any():
-            frame.loc[existing, ASSET_COLUMNS] = [row[column] for column in ASSET_COLUMNS]
+            matching_indices = frame.index[existing]
+            frame.loc[matching_indices[0], ASSET_COLUMNS] = [row[column] for column in ASSET_COLUMNS]
+            frame = frame.drop(matching_indices[1:])
         else:
             frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
         frame.to_csv(self.asset_path, index=False)
@@ -270,6 +282,7 @@ class CsvTableStore:
         name = str(record.get("configuration_name", "")).strip()
         if not name:
             raise ValueError("configuration_name is required.")
+        record["configuration_name"] = name
         if str(record.get("asset", "")) not in set(self.assets()["asset_name"].astype(str)):
             raise ValueError("Select an asset that exists in assets.csv.")
         if record.get("price_timeframe") not in PRICE_TIMEFRAMES:
@@ -287,10 +300,12 @@ class CsvTableStore:
         frame = self.configurations()
         if record["active"]:
             frame["active"] = False
-        existing = frame["configuration_name"].astype(str) == name
+        existing = frame["configuration_name"].astype(str).str.strip() == name
         row = {column: record.get(column, "") for column in CONFIGURATION_COLUMNS}
         if existing.any():
-            frame.loc[existing, CONFIGURATION_COLUMNS] = [row[column] for column in CONFIGURATION_COLUMNS]
+            matching_indices = frame.index[existing]
+            frame.loc[matching_indices[0], CONFIGURATION_COLUMNS] = [row[column] for column in CONFIGURATION_COLUMNS]
+            frame = frame.drop(matching_indices[1:])
         else:
             frame = pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
         if not frame["active"].map(_bool).any() and len(frame):
@@ -395,11 +410,44 @@ class DynamicDataLoader:
             result = numeric.resample(self.frequency).mean().interpolate(method="time")
         else:
             raise ValueError(f"Unsupported resampling method {method!r}.")
+        if method != "ffill":
+            # Fill finer-granularity intervals while the source points on both
+            # sides of the configured range are still available.
+            result = result.interpolate(method="time", limit_area="inside")
         result = result.reindex(self.target_dates)
         result = result.ffill() if method == "ffill" else result.interpolate(method="time", limit_area="inside")
         if result.isna().any().any():
             bad = result.columns[result.isna().any()].tolist()
             raise ValueError(f"{source} does not cover the configured range for columns {bad}.")
+        return result.rename_axis("Date").reset_index()
+
+    def _resample_generation(self, frame: pd.DataFrame, columns: list[str], source: str) -> pd.DataFrame:
+        """Convert average generation power into energy for each optimizer interval."""
+        missing = [column for column in ["Date", *columns] if column not in frame]
+        if missing:
+            raise KeyError(f"{source} is missing columns: {missing}")
+        work = frame[["Date", *columns]].copy()
+        work["Date"] = self._parse_dates(work["Date"], source)
+        work = work.sort_values("Date").drop_duplicates("Date", keep="last").set_index("Date")
+        numeric = work[columns].apply(pd.to_numeric, errors="coerce")
+        source_intervals = numeric.index.to_series().diff().dropna()
+        if source_intervals.empty:
+            raise ValueError(f"{source} needs at least two dated rows to determine its interval.")
+        source_interval = source_intervals.median()
+        target_interval = pd.Timedelta(minutes=self.granularity)
+        if target_interval < source_interval:
+            # Generation values represent average MW over their source
+            # interval. Hold that power constant when splitting the interval.
+            result = numeric.resample(self.frequency).ffill()
+        else:
+            result = numeric.resample(self.frequency).mean()
+        result = result.reindex(self.target_dates)
+        result = result.interpolate(method="time", limit_area="inside")
+        if result.isna().any().any():
+            bad = result.columns[result.isna().any()].tolist()
+            raise ValueError(f"{source} does not cover the configured range for columns {bad}.")
+        # The optimizer's flow variables are MWh per interval, not MW.
+        result[columns] = result[columns] * (self.granularity / 60)
         return result.rename_axis("Date").reset_index()
 
     @staticmethod
@@ -436,18 +484,37 @@ class DynamicDataLoader:
     def _load_standard_year(self, code: str, path: Path, frame: pd.DataFrame) -> pd.DataFrame:
         if code.endswith("M") and "Date" in frame:
             columns = self._sample_columns(frame, int(self.configuration["generation_series_start"]), int(self.configuration["generation_series_stop"]))
-            return self._resample(frame, columns, "mean", path.name)
+            return self._resample_generation(frame, columns, path.name)
         asset = str(self.asset["asset_name"])
         required = ["Year", "Month", "Day", "Hour", asset]
         missing = [column for column in required if column not in frame]
         if missing:
             raise KeyError(f"{path.name} is missing columns: {missing}")
         year_count = self.end.year - self.start.year + 1
-        work = frame.loc[pd.to_numeric(frame["Year"], errors="coerce").between(1, year_count), required].copy()
+        source_year = pd.to_numeric(frame["Year"], errors="coerce")
+        work = frame.loc[source_year.between(1, year_count), required].copy()
+        boundary = frame.loc[
+            source_year.eq(year_count + 1)
+            & pd.to_numeric(frame["Month"], errors="coerce").eq(1)
+            & pd.to_numeric(frame["Day"], errors="coerce").eq(1)
+            & pd.to_numeric(frame["Hour"], errors="coerce").eq(1),
+            required,
+        ].head(1).copy()
+        if boundary.empty:
+            boundary = frame.loc[
+                source_year.eq(source_year.min())
+                & pd.to_numeric(frame["Month"], errors="coerce").eq(1)
+                & pd.to_numeric(frame["Day"], errors="coerce").eq(1)
+                & pd.to_numeric(frame["Hour"], errors="coerce").eq(1),
+                required,
+            ].head(1).copy()
+        if not boundary.empty:
+            boundary["Year"] = year_count + 1
+            work = pd.concat([work, boundary], ignore_index=True)
         work["Date"] = pd.to_datetime({"year": self.start.year + work["Year"].astype(int) - 1, "month": work["Month"].astype(int), "day": work["Day"].astype(int), "hour": work["Hour"].astype(int) - 1}, errors="coerce")
         work = work.dropna(subset=["Date"])[["Date", asset]]
         hourly = work.set_index("Date")[asset].sort_index().reindex(pd.date_range(work["Date"].min(), work["Date"].max(), freq="1h")).interpolate(method="time").rename_axis("Date").reset_index()
-        return self._resample(hourly, [asset], "mean", path.name).rename(columns={asset: "Scenario 1"})
+        return self._resample_generation(hourly, [asset], path.name).rename(columns={asset: "Scenario 1"})
 
     def load_generation(self, code: str) -> pd.DataFrame:
         path = self.resolve_source(code)
@@ -456,14 +523,17 @@ class DynamicDataLoader:
             return self._load_standard_year(code, path, frame)
         if code.endswith("M"):
             columns = self._sample_columns(frame, int(self.configuration["generation_series_start"]), int(self.configuration["generation_series_stop"]))
-            return self._resample(frame, columns, "mean", path.name)
+            return self._resample_generation(frame, columns, path.name)
         asset = str(self.asset["asset_name"])
         column = next((value for value in (asset, "Generation") if value in frame), None)
         if column is None:
             raise KeyError(f"Neither {asset!r} nor 'Generation' is present in {path.name}.")
-        return self._resample(frame, [column], "mean", path.name).rename(columns={column: "Scenario 1"})
+        return self._resample_generation(frame, [column], path.name).rename(columns={column: "Scenario 1"})
 
     def load_lgc(self) -> pd.DataFrame:
+        override = float(self.asset.get("LGC_price_override_per_MWh", 0) or 0)
+        if override > 0:
+            return pd.DataFrame({"Date": self.target_dates, "LGC": override})
         path = self.resolve_source("C1")
         return self._resample(pd.read_csv(path), ["LGC price"], "ffill", path.name).rename(columns={"LGC price": "LGC"})
 
@@ -521,7 +591,9 @@ class DynamicDataLoader:
         if code == "F1":
             duration, power = float(self.asset["BESS_duration_hours"]), float(self.asset["BESS_power_MW"])
             usable_fraction = float(self.asset["BESS_usable_fraction"])
-            return pd.DataFrame([{"BESS_Duration_h": duration, "BESS_Power_MW": power, "BESS_MWh": duration * power * usable_fraction, "BESS_MWh_per_interval": power * self.granularity / 60}])
+            energy_override = float(self.asset.get("BESS_energy_override_MWh", 0) or 0)
+            energy = energy_override if energy_override > 0 else duration * power * usable_fraction
+            return pd.DataFrame([{"BESS_Duration_h": duration, "BESS_Power_MW": power, "BESS_MWh": energy, "BESS_MWh_per_interval": power * self.granularity / 60}])
         path = self.resolve_source("F1M")
         result = pd.read_csv(path)
         missing = [column for column in columns if column not in result]
@@ -588,7 +660,15 @@ def load_active_runtime() -> dict:
     configuration["generation_source"] = route_generation(configuration)
     configuration["bess_source"] = route_bess(configuration)
     granularity = int(configuration["optimization_granularity_in_minutes"])
-    transform = str(configuration["prediction_signal_transform"])
+    perfect_price_foresight = (
+        configuration["price_timeframe"] == "Historical back-test"
+        and configuration["price_foresight"] == "Perfect foresight"
+    )
+    transform = (
+        "Normal predicted value"
+        if perfect_price_foresight
+        else str(configuration["prediction_signal_transform"])
+    )
     predicted_price_type = {"Normal predicted value": 1, "Transform to binary signal": 2, "Both": 3}[transform]
     run_multiple = any(_bool(configuration[field]) for field in ("price_run_synthetic_distribution", "generation_run_synthetic_distribution", "bess_run_synthetic_distribution"))
     return {
@@ -599,16 +679,18 @@ def load_active_runtime() -> dict:
         "demand_charge_shoulder": float(asset["demand_charge_shoulder"]),
         "demand_charge_peak": float(asset["demand_charge_peak"]),
         "export_charge_sun_soaker": float(asset["export_charge_sun_soaker"]),
+        "optimize_with_duos": _bool(asset["optimize_with_DUOS"]),
         "tlf_pv_injection": float(asset["TLF_PV_injection"]),
         "tlf_bess_injection": float(asset["TLF_BESS_injection"]),
         "tlf_bess_withdrawal": float(asset["TLF_BESS_withdrawal"]),
+        "price_escalation_factor": float(asset["price_escalation_factor"]),
         "lgc_eligibility_basis": str(asset["LGC_eligibility_basis"]),
         "start_soc": float(asset["BESS_Start_SoC"]), "cycles_per_day": float(asset["BESS_cycles_per_day"]),
         "operation_granularity_in_minutes": granularity,
         "optimization_avoid_edge_effect_total_hours": float(configuration["optimization_avoid_edge_effect_hours"]),
         "number_of_intervals_per_window": int(configuration["number_of_intervals_per_window"]),
-        "curtailment_penalty": float(configuration["curtailment_penalty"]),
-        "trade_signal_penalty": float(configuration["trade_signal_penalty"]),
+        "curtailment_penalty": 0.0 if perfect_price_foresight else float(configuration["curtailment_penalty"]),
+        "trade_signal_penalty": 0.0 if perfect_price_foresight else float(configuration["trade_signal_penalty"]),
         "execution_mode": configuration["execution_mode"],
         "display_window_scheduler_visual": _bool(configuration["display_window_scheduler_visual"]),
         "prediction_signal_transform": 1 if transform == "Normal predicted value" else 2,
@@ -656,14 +738,18 @@ class ConfigurationEditor:
             "project_poi_export_limit_MWh_per_interval": w.FloatText(disabled=True),
             "project_poi_import_limit_MWh_per_interval": w.FloatText(disabled=True),
             "grid_import_penalty": w.FloatText(),
+            "optimize_with_DUOS": w.Checkbox(value=True),
             "TLF_PV_injection": w.FloatText(value=1.0),
             "TLF_BESS_injection": w.FloatText(value=1.0),
             "TLF_BESS_withdrawal": w.FloatText(value=1.0),
+            "price_escalation_factor": w.FloatText(value=1.0),
             "LGC_eligibility_basis": w.Dropdown(options=LGC_ELIGIBILITY_BASES),
+            "LGC_price_override_per_MWh": w.FloatText(value=0.0),
             "BESS_technology": w.Dropdown(options=self.store.bess_technologies()),
             "BESS_coupling_type": w.Dropdown(options=("AC", "DC")),
             "BESS_duration_hours": w.FloatText(), "BESS_power_MW": w.FloatText(),
             "BESS_usable_fraction": w.BoundedFloatText(min=0.000001, max=1, step=0.01, value=1.0),
+            "BESS_energy_override_MWh": w.FloatText(value=0.0),
             "BESS_Start_SoC": w.BoundedFloatText(min=0, max=1, step=0.05),
             "BESS_cycles_per_day": w.FloatText(), "BESS_lifetime_years": w.IntText(),
         }
@@ -724,8 +810,8 @@ class ConfigurationEditor:
             a["record"],
             self._section("General details", [(name, a[name]) for name in ("asset_name", "state", "tariff_code")]),
             self._section("Automatic tariff values", [(name, a[name]) for name in ("demand_charge_off_peak", "demand_charge_shoulder", "demand_charge_peak", "export_charge_sun_soaker")]),
-            self._section("Grid and settlement information", [(name, a[name]) for name in ("project_poi_export_limit_MW", "project_poi_import_limit_MW", "project_poi_export_limit_MWh_per_interval", "project_poi_import_limit_MWh_per_interval", "grid_import_penalty", "TLF_PV_injection", "TLF_BESS_injection", "TLF_BESS_withdrawal", "LGC_eligibility_basis")]),
-            self._section("BESS information", [(name, a[name]) for name in ("BESS_technology", "BESS_coupling_type", "BESS_duration_hours", "BESS_power_MW", "BESS_usable_fraction", "BESS_Start_SoC", "BESS_cycles_per_day", "BESS_lifetime_years")]),
+            self._section("Grid and settlement information", [(name, a[name]) for name in ("project_poi_export_limit_MW", "project_poi_import_limit_MW", "project_poi_export_limit_MWh_per_interval", "project_poi_import_limit_MWh_per_interval", "grid_import_penalty", "optimize_with_DUOS", "TLF_PV_injection", "TLF_BESS_injection", "TLF_BESS_withdrawal", "price_escalation_factor", "LGC_eligibility_basis", "LGC_price_override_per_MWh")]),
+            self._section("BESS information", [(name, a[name]) for name in ("BESS_technology", "BESS_coupling_type", "BESS_duration_hours", "BESS_power_MW", "BESS_usable_fraction", "BESS_energy_override_MWh", "BESS_Start_SoC", "BESS_cycles_per_day", "BESS_lifetime_years")]),
             asset_save,
         ])
         config_save = w.Button(description="Save configuration", button_style="success")
@@ -839,6 +925,12 @@ class ConfigurationEditor:
         else:
             c["price_foresight"].options = FORESIGHT_TYPES
             c["price_foresight"].disabled = False
+        perfect_price_foresight = (
+            c["price_timeframe"].value == "Historical back-test"
+            and c["price_foresight"].value == "Perfect foresight"
+        )
+        for name in ("trade_signal_penalty", "prediction_signal_transform", "curtailment_penalty"):
+            c[name].disabled = perfect_price_foresight
         if c["generation_timeframe"].value == "Future projection":
             c["generation_foresight"].options = ("Not applicable",)
             c["generation_foresight"].disabled = True

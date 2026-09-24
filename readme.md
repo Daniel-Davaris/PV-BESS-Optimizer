@@ -24,6 +24,12 @@ results include separate energy revenue, LGC revenue, DUOS charges, and net
 merchant revenue columns; monthly DUOS maxima are carried across rolling
 windows so a calendar month is charged only once.
 
+Asset-specific benchmark cases can also set a nominal price-escalation factor,
+an LGC price override, and an explicit internal BESS-energy override. The
+`optimize_with_DUOS` choice controls whether network demand charges influence
+dispatch; DUOS is still calculated and reported separately. Results include
+both gross merchant revenue and net merchant revenue after DUOS.
+
 Raw source filenames follow the convention documented in the loader notebook.
 State tokens are lowercase (for example `..._nsw.csv`) and spaces in asset
 tokens are replaced with underscores (for example `..._Orange_2B.csv`).
